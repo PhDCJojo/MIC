@@ -44,7 +44,25 @@ found in [experiments.py](experiments.py).
 The experiment progress is logged on Weights&Biases.
 
 For VisDA-2017, the mean over the class accuracies is reported. This value is denoted
-as 'mean correct' in the logs as explained in https://github.com/val-iisc/SDAT/issues/1. 
+as 'mean correct' in the logs as explained in https://github.com/val-iisc/SDAT/issues/1.
+
+## Feature visualization
+
+You can visualize the feature distribution of a trained model with a t-SNE plot
+using the helper script in `examples/plot_tsne.py`. The script restores the
+classifier checkpoint, collects features for both domains and writes the
+visualization to disk:
+
+```shell
+python examples/plot_tsne.py \
+  --data OfficeHome --root examples/data \
+  --source Art --target Clipart \
+  --arch resnet50 --checkpoint <path-to-checkpoint> \
+  --output outputs/officehome_art2clipart_tsne.pdf --max-samples 1000
+```
+
+Use `--max-samples` to subsample the features for quicker experimentation or
+`--max-batches` to limit the number of batches collected per domain.
 
 ## Where to find MIC in the code?
 

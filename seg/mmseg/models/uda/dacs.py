@@ -31,6 +31,7 @@ from torch.nn.modules.dropout import _DropoutNd
 from mmseg.core import add_prefix
 from mmseg.models import UDA, HRDAEncoderDecoder, build_segmentor
 from mmseg.models.segmentors.hrda_encoder_decoder import crop
+from mmseg.models.uda.classwise_contrast import ClasswiseContrastiveLoss
 from mmseg.models.uda.masking_consistency_module import \
     MaskingConsistencyModule
 from mmseg.models.uda.uda_decorator import UDADecorator, get_module
@@ -99,6 +100,16 @@ class DACS(UDADecorator):
             self.imnet_model = build_segmentor(deepcopy(cfg['model']))
         else:
             self.imnet_model = None
+
+        contrast_cfg = deepcopy(cfg.get('contrastive', None))
+        self.contrastive_align = None
+        self.enable_contrastive = False
+        if contrast_cfg:
+            enable = contrast_cfg.pop('enable', True)
+            if enable:
+                contrast_cfg.setdefault('num_classes', self.num_classes)
+                self.contrastive_align = ClasswiseContrastiveLoss(**contrast_cfg)
+                self.enable_contrastive = True
 
     def get_ema_model(self):
         return get_module(self.ema_model)
@@ -251,6 +262,15 @@ class DACS(UDADecorator):
         feat_log.pop('loss', None)
         return feat_loss, feat_log
 
+    def _select_contrastive_feat(self, feat):
+        if isinstance(feat, (list, tuple)):
+            return self._select_contrastive_feat(feat[-1])
+        if isinstance(feat, dict):
+            # Take the last key deterministically to keep alignment stable
+            key = sorted(feat.keys())[-1]
+            return self._select_contrastive_feat(feat[key])
+        return feat
+
     def update_debug_state(self):
         debug = self.local_iter % self.debug_img_interval == 0
         self.get_model().automatic_debug = False
@@ -264,25 +284,35 @@ class DACS(UDADecorator):
     def get_pseudo_label_and_weight(self, logits):
         ema_softmax = torch.softmax(logits.detach(), dim=1)
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
-        ps_large_p = pseudo_prob.ge(self.pseudo_threshold).long() == 1
+        ps_large_p = pseudo_prob.ge(self.pseudo_threshold)
         ps_size = np.size(np.array(pseudo_label.cpu()))
         pseudo_weight = torch.sum(ps_large_p).item() / ps_size
         pseudo_weight = pseudo_weight * torch.ones(
             pseudo_prob.shape, device=logits.device)
-        return pseudo_label, pseudo_weight
+        return pseudo_label, pseudo_weight, ps_large_p
 
-    def filter_valid_pseudo_region(self, pseudo_weight, valid_pseudo_mask):
+    def filter_valid_pseudo_region(self, pseudo_weight, valid_pseudo_mask,
+                                   confidence_mask=None):
         if self.psweight_ignore_top > 0:
             # Don't trust pseudo-labels in regions with potential
             # rectification artifacts. This can lead to a pseudo-label
             # drift from sky towards building or traffic light.
             assert valid_pseudo_mask is None
             pseudo_weight[:, :self.psweight_ignore_top, :] = 0
+            if confidence_mask is not None:
+                confidence_mask[:, :self.psweight_ignore_top, :] = 0
         if self.psweight_ignore_bottom > 0:
             assert valid_pseudo_mask is None
             pseudo_weight[:, -self.psweight_ignore_bottom:, :] = 0
+            if confidence_mask is not None:
+                confidence_mask[:, -self.psweight_ignore_bottom:, :] = 0
         if valid_pseudo_mask is not None:
             pseudo_weight *= valid_pseudo_mask.squeeze(1)
+            if confidence_mask is not None:
+                confidence_mask *= valid_pseudo_mask.squeeze(1).bool()
+        if confidence_mask is not None:
+            confidence_mask = confidence_mask.bool()
+            return pseudo_weight, confidence_mask
         return pseudo_weight
 
     def forward_train(self,
@@ -345,7 +375,8 @@ class DACS(UDADecorator):
         seg_debug['Source'] = self.get_model().debug_output
         clean_loss, clean_log_vars = self._parse_losses(clean_losses)
         log_vars.update(clean_log_vars)
-        clean_loss.backward(retain_graph=self.enable_fdist)
+        clean_loss.backward(
+            retain_graph=self.enable_fdist or self.enable_contrastive)
         if self.print_grad_magnitude:
             params = self.get_model().backbone.parameters()
             seg_grads = [
@@ -368,7 +399,7 @@ class DACS(UDADecorator):
                 fd_grads = [g2 - g1 for g1, g2 in zip(seg_grads, fd_grads)]
                 grad_mag = calc_grad_magnitude(fd_grads)
                 mmcv.print_log(f'Fdist Grad.: {grad_mag}', 'mmseg')
-        del src_feat, clean_loss
+        del clean_loss
         if self.enable_fdist:
             del feat_loss
 
@@ -384,13 +415,44 @@ class DACS(UDADecorator):
                 target_img, target_img_metas)
             seg_debug['Target'] = self.get_ema_model().debug_output
 
-            pseudo_label, pseudo_weight = self.get_pseudo_label_and_weight(
+            pseudo_label, pseudo_weight, pseudo_confidence = \
+                self.get_pseudo_label_and_weight(
                 ema_logits)
             del ema_logits
 
-            pseudo_weight = self.filter_valid_pseudo_region(
-                pseudo_weight, valid_pseudo_mask)
+            filtered = self.filter_valid_pseudo_region(
+                pseudo_weight, valid_pseudo_mask,
+                pseudo_confidence.float())
+            if isinstance(filtered, tuple):
+                pseudo_weight, pseudo_confidence = filtered
+            else:
+                pseudo_weight = filtered
+                pseudo_confidence = pseudo_confidence & pseudo_weight.bool()
             gt_pixel_weight = torch.ones((pseudo_weight.shape), device=dev)
+
+            if self.enable_contrastive:
+                tgt_feat_full = self.get_model().extract_feat(target_img)
+                src_feat_for_ctr = self._select_contrastive_feat(src_feat)
+                tgt_feat_for_ctr = self._select_contrastive_feat(tgt_feat_full)
+                contrast_out = self.contrastive_align(
+                    src_feat_for_ctr,
+                    gt_semantic_seg,
+                    tgt_feat_for_ctr,
+                    pseudo_label,
+                    pseudo_confidence)
+                if contrast_out is not None:
+                    contrast_losses, contrast_stats = contrast_out
+                    contrast_losses = add_prefix(contrast_losses, 'contrast')
+                    contrast_loss, contrast_log = self._parse_losses(
+                        contrast_losses)
+                    contrast_log.pop('loss', None)
+                    log_vars.update(contrast_log)
+                    for key, val in contrast_stats.items():
+                        if torch.is_tensor(val):
+                            val = val.detach().cpu().item()
+                        log_vars[f'contrast_{key}'] = float(val)
+                    contrast_loss.backward(retain_graph=self.enable_fdist)
+                del tgt_feat_full
 
             # Apply mixing
             mixed_img, mixed_lbl = [None] * batch_size, [None] * batch_size
@@ -424,6 +486,8 @@ class DACS(UDADecorator):
             mix_loss, mix_log_vars = self._parse_losses(mix_losses)
             log_vars.update(mix_log_vars)
             mix_loss.backward()
+
+        del src_feat
 
         # Masked Training
         if self.enable_masking and self.mask_mode.startswith('separate'):

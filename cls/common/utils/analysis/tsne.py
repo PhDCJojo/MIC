@@ -13,7 +13,8 @@ import matplotlib.colors as col
 
 
 def visualize(source_feature: torch.Tensor, target_feature: torch.Tensor,
-              filename: str, source_color='r', target_color='b'):
+              filename: str, source_color: str = 'r', target_color: str = 'b',
+              random_state: int = 33):
     """
     Visualize features from different domains using t-SNE.
 
@@ -23,6 +24,8 @@ def visualize(source_feature: torch.Tensor, target_feature: torch.Tensor,
         filename (str): the file name to save t-SNE
         source_color (str): the color of the source features. Default: 'r'
         target_color (str): the color of the target features. Default: 'b'
+        random_state (int): random seed passed to :class:`sklearn.manifold.TSNE`.
+            Default: 33.
 
     """
     source_feature = source_feature.numpy()
@@ -30,7 +33,7 @@ def visualize(source_feature: torch.Tensor, target_feature: torch.Tensor,
     features = np.concatenate([source_feature, target_feature], axis=0)
 
     # map features to 2-d using TSNE
-    X_tsne = TSNE(n_components=2, random_state=33).fit_transform(features)
+    X_tsne = TSNE(n_components=2, random_state=random_state).fit_transform(features)
 
     # domain labels, 1 represents source while 0 represents target
     domains = np.concatenate((np.ones(len(source_feature)), np.zeros(len(target_feature))))

@@ -6,7 +6,8 @@
 # ---------------------------------------------------------------
 
 from mmseg.models.uda.advseg import AdvSeg
+from mmseg.models.uda.classwise_contrast import ClasswiseContrastiveLoss
 from mmseg.models.uda.dacs import DACS
 from mmseg.models.uda.minent import MinEnt
 
-__all__ = ['DACS', 'MinEnt', 'AdvSeg']
+__all__ = ['DACS', 'MinEnt', 'AdvSeg', 'ClasswiseContrastiveLoss']
