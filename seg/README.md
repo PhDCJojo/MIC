@@ -149,6 +149,26 @@ python -m tools.test path/to/config_file path/to/checkpoint_file --test-set --fo
 The predictions can be submitted to the public evaluation server of the
 respective dataset to obtain the test score.
 
+## Feature Visualization
+
+You can inspect how the model separates target-domain categories by sampling
+pixel logits and visualizing them with t-SNE:
+
+```shell
+python tools/plot_target_tsne.py \
+    configs/mic/gtaHR2csHR_mic_hrda.py \
+    path/to/checkpoint.pth \
+    --output work_dirs/tsne_target.png \
+    --max-images 40 \
+    --max-per-class 1024 \
+    --device cuda:0
+```
+
+The script follows the data pipeline defined in the configuration and colors
+points according to the ground-truth target labels. Pass `--use-predictions`
+when ground-truth masks are unavailable and optionally store the sampled logits
+with `--save-data`.
+
 ## Checkpoints
 
 Below, we provide checkpoints of MIC(HRDA) for the different benchmarks.

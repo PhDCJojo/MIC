@@ -83,6 +83,14 @@ uda = dict(
     # and a mask ratio of 0.7
     mask_generator=dict(
         type='block', mask_ratio=0.7, mask_block_size=64, _delete_=True))
+uda.update(dict(
+    contrastive=dict(
+        enable=True,
+        temperature=0.07,
+        loss_weight=1.0,
+        min_pixels=256,
+        max_samples=4096,
+        normalize=True)))
 # Optimizer Hyperparameters
 optimizer_config = None
 optimizer = dict(
