@@ -11,6 +11,8 @@ from torch.nn import Module
 from mmseg.models.uda.teacher_module import EMATeacher
 from mmseg.models.utils.dacs_transforms import get_mean_std, strong_transform
 from mmseg.models.utils.masking_transforms import build_mask_generator
+from mmseg.models.utils import MaskCollator as IJEPAMaskCollator
+from mmseg.models.utils import VisionTransformerPredictor
 
 
 class MaskingConsistencyModule(Module):
@@ -28,6 +30,13 @@ class MaskingConsistencyModule(Module):
         self.mask_pseudo_threshold = cfg['mask_pseudo_threshold']
         self.mask_lambda = cfg['mask_lambda']
         self.mask_gen = build_mask_generator(cfg['mask_generator'])
+
+        self.ijepa_cfg = cfg.get('ijepa')
+        self.ijepa_predictor = None
+        self.ijepa_collator = None
+        self.ijepa_patch_size = None
+        self.ijepa_trainable = bool(self.ijepa_cfg.get('trainable', False)) \
+            if self.ijepa_cfg is not None else False
 
         assert self.mask_mode in [
             'separate', 'separatesrc', 'separatetrg', 'separateaug',
@@ -66,6 +75,46 @@ class MaskingConsistencyModule(Module):
         model.debug_output = {}
         dev = img.device
         means, stds = get_mean_std(img_metas, dev)
+
+        if self.ijepa_cfg is not None and target_img is not None:
+            if self.ijepa_predictor is None:
+                predictor_cfg = dict(self.ijepa_cfg.get('predictor', {}))
+                predictor_cfg.setdefault('img_size', tuple(target_img.shape[-2:]))
+                patch_size = predictor_cfg.get(
+                    'patch_size', self.ijepa_cfg.get('patch_size', 16))
+                predictor_cfg['patch_size'] = patch_size
+                self.ijepa_predictor = VisionTransformerPredictor(**predictor_cfg).to(dev)
+                if not self.ijepa_trainable:
+                    self.ijepa_predictor.eval()
+                if isinstance(patch_size, int):
+                    self.ijepa_patch_size = (patch_size, patch_size)
+                else:
+                    self.ijepa_patch_size = tuple(patch_size)
+
+            if self.ijepa_collator is None:
+                collator_cfg = dict(self.ijepa_cfg.get('mask_collator', {}))
+                collator_cfg.setdefault('input_size', tuple(target_img.shape[-2:]))
+                collator_cfg.setdefault('patch_size', self.ijepa_patch_size)
+                self.ijepa_collator = IJEPAMaskCollator(**collator_cfg)
+
+            mask_dict = self.ijepa_collator(target_img)
+            ijepa_mask = mask_dict['mask']
+            if self.ijepa_trainable:
+                target_img = self.ijepa_predictor(target_img, ijepa_mask)
+            else:
+                with torch.no_grad():
+                    target_img = self.ijepa_predictor(target_img, ijepa_mask)
+
+            if self.debug:
+                upsampled_mask = self.ijepa_collator.upsample(
+                    ijepa_mask, (target_img.shape[-2], target_img.shape[-1])
+                )
+                prediction = self.ijepa_predictor.last_prediction
+                self.debug_output['IJepa'] = {
+                    'Mask': upsampled_mask.detach().cpu().numpy(),
+                    'Prediction': None if prediction is None else
+                    prediction.cpu().numpy(),
+                }
 
         if not self.source_only:
             # Share the pseudo labels with the host UDA method
